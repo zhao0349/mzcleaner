@@ -51,7 +51,8 @@ def main():
         'packaged_at_utc': datetime.now(timezone.utc).isoformat(),
         'python': sys.version.split()[0], 'architecture': 'Windows x64',
         'build_dependencies': dict(sorted(packages.items())),
-        'source_sha256': {p: hashlib.sha256((ROOT/p).read_bytes()).hexdigest() for p in sources},
+        'source_hash_basis': 'Git blob bytes, matching the source ZIP',
+        'source_sha256': {p: hashlib.sha256(git('show', f'HEAD:{p}')).hexdigest() for p in sources},
     }
     (APP/'BUILD-INFO.json').write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding='utf-8')
     files = sorted(p for p in APP.rglob('*') if p.is_file() and p.name != 'SHA256SUMS.txt')
