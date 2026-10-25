@@ -1,105 +1,57 @@
-"""清理操作模块 - 执行文件删除、目录清理等操作"""
-
+"""执行选中文件删除；只统计实际删除的字节，保留并报告失败。"""
 import os
-import shutil
-import stat
-from pathlib import Path
 from dataclasses import dataclass
-from typing import Callable
 
 
 @dataclass
 class CleanResult:
-    """清理操作结果"""
     success: bool
     path: str
     size: int
     error: str = ""
 
 
-def handle_remove_readonly(func, path, exc):
-    """处理只读文件的删除权限问题"""
-    os.chmod(path, stat.S_IWRITE)
-    func(path)
-
-
 class FileCleaner:
-    """文件清理器"""
-
-    def __init__(self, progress_callback: Callable = None):
-        self.progress_callback = progress_callback
-        self._cancelled = False
-
-    def cancel(self):
-        self._cancelled = True
-
-    def delete_files(self, paths: list[str]) -> list[CleanResult]:
-        """删除指定的文件列表"""
-        self._cancelled = False
+    def delete_files(self, paths):
         results = []
-        total = len(paths)
-
-        for i, path in enumerate(paths):
-            if self._cancelled:
-                break
-
-            if self.progress_callback:
-                self.progress_callback(f"正在删除 ({i + 1}/{total})", i + 1, total)
-
+        for path in paths:
             try:
-                size = os.path.getsize(path)
+                size = os.lstat(path).st_size
                 os.remove(path)
-                results.append(CleanResult(success=True, path=path, size=size))
-            except PermissionError:
-                try:
-                    os.chmod(path, stat.S_IWRITE)
-                    size = os.path.getsize(path)
-                    os.remove(path)
-                    results.append(CleanResult(success=True, path=path, size=size))
-                except Exception as ex:
-                    results.append(CleanResult(success=False, path=path, size=0, error=str(ex)))
+                results.append(CleanResult(True, path, size))
             except FileNotFoundError:
-                results.append(CleanResult(success=True, path=path, size=0))
-            except Exception as ex:
-                results.append(CleanResult(success=False, path=path, size=0, error=str(ex)))
-
+                results.append(CleanResult(True, path, 0))
+            except OSError as ex:
+                results.append(CleanResult(False, path, 0, str(ex)))
         return results
 
-    def clean_directory_contents(self, dir_path: str) -> CleanResult:
-        """清空目录内容（保留目录本身）"""
+    def clean_directory_contents(self, dir_path):
         if not os.path.isdir(dir_path):
-            return CleanResult(success=False, path=dir_path, size=0, error="目录不存在")
-
-        total_size = 0
-        try:
-            for entry in os.scandir(dir_path):
-                if self._cancelled:
-                    break
-                try:
-                    if entry.is_file(follow_symlinks=False):
-                        total_size += entry.stat().st_size
-                        os.remove(entry.path)
-                    elif entry.is_dir(follow_symlinks=False):
-                        total_size += self._get_dir_size(entry.path)
-                        shutil.rmtree(entry.path, onerror=handle_remove_readonly)
-                except Exception:
-                    continue
-            return CleanResult(success=True, path=dir_path, size=total_size)
-        except Exception as ex:
-            return CleanResult(success=False, path=dir_path, size=0, error=str(ex))
-
-    @staticmethod
-    def _get_dir_size(path: str) -> int:
+            return CleanResult(False, dir_path, 0, "目录不存在")
+        if os.path.islink(dir_path) or os.path.isjunction(dir_path):
+            return CleanResult(False, dir_path, 0, "跳过目录链接")
+        errors = []
         total = 0
-        try:
-            for entry in os.scandir(path):
-                try:
-                    if entry.is_file(follow_symlinks=False):
-                        total += entry.stat().st_size
-                    elif entry.is_dir(follow_symlinks=False):
-                        total += FileCleaner._get_dir_size(entry.path)
-                except (OSError, PermissionError):
-                    continue
-        except (OSError, PermissionError):
-            pass
-        return total
+
+        def clean(path):
+            nonlocal total
+            try:
+                with os.scandir(path) as entries:
+                    for entry in entries:
+                        try:
+                            if entry.is_symlink() or entry.is_junction():
+                                errors.append(f"跳过链接：{entry.name}")
+                            elif entry.is_dir(follow_symlinks=False):
+                                clean(entry.path)
+                                os.rmdir(entry.path)
+                            elif entry.is_file(follow_symlinks=False):
+                                size = entry.stat(follow_symlinks=False).st_size
+                                os.remove(entry.path)
+                                total += size
+                        except OSError as ex:
+                            errors.append(f"{entry.name}: {ex}")
+            except OSError as ex:
+                errors.append(str(ex))
+
+        clean(dir_path)
+        return CleanResult(not errors, dir_path, total, "；".join(errors[:3]))

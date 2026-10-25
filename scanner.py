@@ -2,9 +2,7 @@
 
 import os
 import hashlib
-import threading
-from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass
@@ -39,61 +37,12 @@ class ScanTask:
 
 # 扫描类型常量
 SCAN_TYPES = {
-    "basic_clean": ScanTask(
-        scan_type="basic_clean",
-        title="基础清理",
-        description="扫描Windows临时文件、回收站、浏览器缓存等系统垃圾"
-    ),
-    "system_clean": ScanTask(
-        scan_type="system_clean",
-        title="系统清理",
-        description="扫描Windows更新缓存、系统日志、事件日志等深层系统垃圾"
-    ),
-    "wechat_clean": ScanTask(
-        scan_type="wechat_clean",
-        title="微信清理",
-        description="扫描微信聊天缓存、图片、视频、文件等占用空间"
-    ),
-    "qq_clean": ScanTask(
-        scan_type="qq_clean",
-        title="QQ清理",
-        description="扫描QQ聊天缓存、图片、文件等占用空间"
-    ),
-    "user_dir_migrate": ScanTask(
-        scan_type="user_dir_migrate",
-        title="用户目录迁移",
-        description="查看用户文档、桌面、下载等目录占用，支持迁移到其他磁盘"
-    ),
-    "software_usage": ScanTask(
-        scan_type="software_usage",
-        title="软件占用查询",
-        description="查询已安装软件的磁盘占用情况"
-    ),
-    "software_move": ScanTask(
-        scan_type="software_move",
-        title="软件搬家",
-        description="查看大型软件的安装位置，辅助迁移到其他磁盘"
-    ),
-    "large_files": ScanTask(
-        scan_type="large_files",
-        title="大文件查找",
-        description="递归扫描指定目录，找出超过阈值的大文件"
-    ),
-    "duplicate_files": ScanTask(
-        scan_type="duplicate_files",
-        title="重复文件查找",
-        description="通过MD5哈希值精确查找内容完全相同的重复文件"
-    ),
-    "similar_files": ScanTask(
-        scan_type="similar_files",
-        title="相似文件查找",
-        description="根据文件名和大小查找可能相似的文件"
-    ),
-    "dir_size_view": ScanTask(
-        scan_type="dir_size_view",
-        title="目录大小查看",
-        description="计算指定目录下各子目录的大小分布情况"
-    ),
+    "basic_clean": ScanTask("basic_clean", "缓存清理", "扫描用户临时文件、Windows Temp 和 Chrome/Edge 默认配置的缓存；仅清理手动选中的目录。"),
+    "large_files": ScanTask("large_files", "大文件查找", "查找所选目录中不小于 100 MB 的文件；删除前请逐项确认用途。"),
+    "duplicate_files": ScanTask("duplicate_files", "重复文件查找", "按大小与 MD5 比对小于 100 MB 的非空文件；每组保留一份，其余副本供手动选择。"),
+    "similar_files": ScanTask("similar_files", "相似文件分析", "只读：按名称与大小查找 1 KB～10 MB 的相似文件，结果不代表内容相同。"),
+    "dir_size_view": ScanTask("dir_size_view", "目录大小分析", "只读：统计所选目录下各子目录的占用。"),
+    "software_usage": ScanTask("software_usage", "软件占用分析", "只读：根据注册表中的安装路径统计软件占用；不执行卸载或搬家。"),
 }
 
 
@@ -123,17 +72,22 @@ class DiskScanner:
         except (OSError, PermissionError):
             return 0
 
-    @staticmethod
-    def _get_dir_size(dir_path: str) -> int:
+    def _get_dir_size(self, dir_path: str) -> int:
         """计算目录总大小"""
         total = 0
+        if os.path.islink(dir_path) or os.path.isjunction(dir_path):
+            return 0
         try:
             for entry in os.scandir(dir_path):
+                if self._cancelled:
+                    break
+                if entry.is_symlink() or entry.is_junction():
+                    continue
                 try:
                     if entry.is_file(follow_symlinks=False):
                         total += entry.stat().st_size
                     elif entry.is_dir(follow_symlinks=False):
-                        total += DiskScanner._get_dir_size(entry.path)
+                        total += self._get_dir_size(entry.path)
                 except (OSError, PermissionError):
                     continue
         except (OSError, PermissionError):
@@ -159,7 +113,6 @@ class DiskScanner:
         """扫描基础系统垃圾"""
         self._cancelled = False
         results = []
-        targets = []
 
         # Windows Temp
         temp_dir = self._expand_env_path("%TEMP%")
@@ -186,46 +139,8 @@ class DiskScanner:
                     category="临时文件"
                 ))
 
-        # Prefetch
-        prefetch = os.path.join(windir, "Prefetch")
-        if os.path.isdir(prefetch):
-            size = self._get_dir_size(prefetch)
-            if size > 0:
-                results.append(ScanResult(
-                    name="预读取文件(Prefetch)",
-                    path=prefetch,
-                    size=size,
-                    category="系统缓存"
-                ))
-
-        # Recent files
-        userprofile = os.environ.get("USERPROFILE", "")
-        recent = os.path.join(userprofile, "AppData", "Roaming", "Microsoft", "Windows", "Recent")
-        if os.path.isdir(recent):
-            size = self._get_dir_size(recent)
-            if size > 0:
-                results.append(ScanResult(
-                    name="最近文档记录",
-                    path=recent,
-                    size=size,
-                    category="系统记录"
-                ))
-
-        # Recycle Bin (check size)
-        for drive_letter in ["C:", "D:", "E:", "F:"]:
-            recycle = os.path.join(drive_letter + "\\", "$Recycle.Bin")
-            if os.path.isdir(recycle):
-                size = self._get_dir_size(recycle)
-                if size > 0:
-                    results.append(ScanResult(
-                        name=f"回收站({drive_letter})",
-                        path=recycle,
-                        size=size,
-                        category="回收站"
-                    ))
-
         # Browser cache paths
-        appdata_local = os.path.join(userprofile, "AppData", "Local")
+        appdata_local = os.environ.get("LOCALAPPDATA", os.path.join(os.environ.get("USERPROFILE", ""), "AppData", "Local"))
         browser_caches = {
             "Chrome缓存": os.path.join(appdata_local, "Google", "Chrome", "User Data", "Default", "Cache"),
             "Edge缓存": os.path.join(appdata_local, "Microsoft", "Edge", "User Data", "Default", "Cache"),
@@ -248,265 +163,9 @@ class DiskScanner:
         self._report_progress("基础清理扫描完成", len(results), len(results))
         return results
 
-    # ── 系统清理 ──────────────────────────────────────────
 
-    def scan_system_clean(self) -> list[ScanResult]:
-        """扫描系统级垃圾文件"""
-        self._cancelled = False
-        results = []
-        windir = os.environ.get("WINDIR", "C:\\Windows")
 
-        # Windows Update 缓存
-        update_cache = os.path.join(windir, "SoftwareDistribution", "Download")
-        if os.path.isdir(update_cache):
-            size = self._get_dir_size(update_cache)
-            if size > 0:
-                results.append(ScanResult(
-                    name="Windows更新缓存",
-                    path=update_cache,
-                    size=size,
-                    category="系统更新"
-                ))
 
-        # Delivery Optimization
-        delopt = os.path.join(windir, "SoftwareDistribution", "DeliveryOptimization")
-        if os.path.isdir(delopt):
-            size = self._get_dir_size(delopt)
-            if size > 0:
-                results.append(ScanResult(
-                    name="传递优化文件",
-                    path=delopt,
-                    size=size,
-                    category="系统更新"
-                ))
-
-        # CBS Logs
-        cbs_logs = os.path.join(windir, "Logs", "CBS")
-        if os.path.isdir(cbs_logs):
-            size = self._get_dir_size(cbs_logs)
-            if size > 0:
-                results.append(ScanResult(
-                    name="CBS系统日志",
-                    path=cbs_logs,
-                    size=size,
-                    category="系统日志"
-                ))
-
-        # Windows Logs
-        logs_dir = os.path.join(windir, "Logs")
-        if os.path.isdir(logs_dir):
-            size = self._get_dir_size(logs_dir)
-            if size > 0:
-                results.append(ScanResult(
-                    name="Windows日志目录",
-                    path=logs_dir,
-                    size=size,
-                    category="系统日志"
-                ))
-
-        # Dism cleanup
-        winsxs = os.path.join(windir, "WinSxS", "ManifestCache")
-        if os.path.isdir(winsxs):
-            size = self._get_dir_size(winsxs)
-            if size > 0:
-                results.append(ScanResult(
-                    name="WinSxS清单缓存",
-                    path=winsxs,
-                    size=size,
-                    category="系统缓存"
-                ))
-
-        # DriverStore FileRepository
-        driver_repo = os.path.join(windir, "System32", "DriverStore", "FileRepository")
-        if os.path.isdir(driver_repo):
-            size = self._get_dir_size(driver_repo)
-            if size > 0:
-                results.append(ScanResult(
-                    name="驱动备份仓库",
-                    path=driver_repo,
-                    size=size,
-                    category="系统备份"
-                ))
-
-        # ServicePack backup
-        sp_backup = os.path.join(windir, "ServicePackFiles")
-        if os.path.isdir(sp_backup):
-            size = self._get_dir_size(sp_backup)
-            if size > 0:
-                results.append(ScanResult(
-                    name="ServicePack备份",
-                    path=sp_backup,
-                    size=size,
-                    category="系统备份"
-                ))
-
-        # FontCache
-        userprofile = os.environ.get("USERPROFILE", "")
-        font_cache = os.path.join(userprofile, "AppData", "Local", "Microsoft", "Windows", "FontCache")
-        if os.path.isdir(font_cache):
-            size = self._get_dir_size(font_cache)
-            if size > 0:
-                results.append(ScanResult(
-                    name="字体缓存",
-                    path=font_cache,
-                    size=size,
-                    category="系统缓存"
-                ))
-
-        self._results = results
-        self._total_size = sum(r.size for r in results)
-        self._report_progress("系统清理扫描完成", len(results), len(results))
-        return results
-
-    # ── 微信清理 ──────────────────────────────────────────
-
-    def scan_wechat_clean(self) -> list[ScanResult]:
-        """扫描微信缓存文件"""
-        self._cancelled = False
-        results = []
-        userprofile = os.environ.get("USERPROFILE", "")
-        wechat_base = os.path.join(userprofile, "Documents", "WeChat Files")
-
-        if not os.path.isdir(wechat_base):
-            self._report_progress("未找到微信数据目录", 0, 0)
-            return results
-
-        # 遍历微信号目录
-        for wxid in self._safe_listdir(wechat_base):
-            wx_path = os.path.join(wechat_base, wxid)
-            if not os.path.isdir(wx_path):
-                continue
-
-            # FileStorage 下的各类缓存
-            file_storage = os.path.join(wx_path, "FileStorage")
-            if os.path.isdir(file_storage):
-                sub_dirs = {
-                    "Image": "图片缓存",
-                    "Video": "视频缓存",
-                    "File": "收发文件",
-                    "MsgAttach": "聊天附件",
-                    "CustomEmotion": "表情缓存",
-                    "Temp": "临时文件",
-                }
-                for sub, label in sub_dirs.items():
-                    sub_path = os.path.join(file_storage, sub)
-                    if os.path.isdir(sub_path):
-                        size = self._get_dir_size(sub_path)
-                        if size > 0:
-                            results.append(ScanResult(
-                                name=f"微信-{label}({wxid})",
-                                path=sub_path,
-                                size=size,
-                                category="微信缓存"
-                            ))
-            else:
-                # 旧版本微信目录结构
-                sub_dirs_map = {
-                    "Image": "图片",
-                    "Video": "视频",
-                    "File": "文件",
-                }
-                for sub, label in sub_dirs_map.items():
-                    sub_path = os.path.join(wx_path, sub)
-                    if os.path.isdir(sub_path):
-                        size = self._get_dir_size(sub_path)
-                        if size > 0:
-                            results.append(ScanResult(
-                                name=f"微信-{label}({wxid})",
-                                path=sub_path,
-                                size=size,
-                                category="微信缓存"
-                            ))
-
-        self._results = results
-        self._total_size = sum(r.size for r in results)
-        self._report_progress("微信清理扫描完成", len(results), len(results))
-        return results
-
-    # ── QQ清理 ────────────────────────────────────────────
-
-    def scan_qq_clean(self) -> list[ScanResult]:
-        """扫描QQ缓存文件"""
-        self._cancelled = False
-        results = []
-        userprofile = os.environ.get("USERPROFILE", "")
-        qq_base = os.path.join(userprofile, "Documents", "Tencent Files")
-
-        if not os.path.isdir(qq_base):
-            self._report_progress("未找到QQ数据目录", 0, 0)
-            return results
-
-        for qqnum in self._safe_listdir(qq_base):
-            qq_path = os.path.join(qq_base, qqnum)
-            if not os.path.isdir(qq_path):
-                continue
-
-            sub_dirs = {
-                "Image": "图片",
-                "Video": "视频",
-                "FileRecv": "接收文件",
-                "Audio": "语音消息",
-                "Pic": "聊天图片",
-            }
-            for sub, label in sub_dirs.items():
-                sub_path = os.path.join(qq_path, sub)
-                if os.path.isdir(sub_path):
-                    # 先看子目录（如 Group2, C2C, MobileFile）
-                    total_size = 0
-                    for inner in self._safe_listdir(sub_path):
-                        inner_path = os.path.join(sub_path, inner)
-                        if os.path.isdir(inner_path):
-                            total_size += self._get_dir_size(inner_path)
-                    if total_size == 0:
-                        total_size = self._get_dir_size(sub_path)
-                    if total_size > 0:
-                        results.append(ScanResult(
-                            name=f"QQ-{label}({qqnum})",
-                            path=sub_path,
-                            size=total_size,
-                            category="QQ缓存"
-                        ))
-
-        self._results = results
-        self._total_size = sum(r.size for r in results)
-        self._report_progress("QQ清理扫描完成", len(results), len(results))
-        return results
-
-    # ── 用户目录迁移 ──────────────────────────────────────
-
-    def scan_user_dirs(self) -> list[ScanResult]:
-        """扫描用户目录大小"""
-        self._cancelled = False
-        results = []
-        userprofile = os.environ.get("USERPROFILE", "")
-
-        user_dirs = {
-            "桌面": os.path.join(userprofile, "Desktop"),
-            "文档": os.path.join(userprofile, "Documents"),
-            "下载": os.path.join(userprofile, "Downloads"),
-            "图片": os.path.join(userprofile, "Pictures"),
-            "音乐": os.path.join(userprofile, "Music"),
-            "视频": os.path.join(userprofile, "Videos"),
-            "收藏夹": os.path.join(userprofile, "Favorites"),
-            "桌面(公用)": os.path.join(os.environ.get("PUBLIC", ""), "Desktop"),
-        }
-
-        for name, path in user_dirs.items():
-            if os.path.isdir(path):
-                self._report_progress(f"正在计算: {name}", 0, 0)
-                size = self._get_dir_size(path)
-                results.append(ScanResult(
-                    name=name,
-                    path=path,
-                    size=size,
-                    category="用户目录",
-                    is_file=False
-                ))
-
-        self._results = results
-        self._total_size = sum(r.size for r in results)
-        self._report_progress("用户目录扫描完成", len(results), len(results))
-        return results
 
     # ── 软件占用查询 ──────────────────────────────────────
 
@@ -590,7 +249,7 @@ class DiskScanner:
                     if self._cancelled:
                         break
                     # 跳过系统目录
-                    dirs[:] = [d for d in dirs if not d.startswith("$") and d not in ("System Volume Information",)]
+                    dirs[:] = [d for d in dirs if not d.startswith("$") and d not in ("System Volume Information",) and not os.path.isjunction(os.path.join(root, d))]
                     for filename in files:
                         if self._cancelled:
                             break
@@ -634,7 +293,7 @@ class DiskScanner:
                 for root, dirs, files in os.walk(scan_root):
                     if self._cancelled:
                         break
-                    dirs[:] = [d for d in dirs if not d.startswith("$") and d not in ("System Volume Information",)]
+                    dirs[:] = [d for d in dirs if not d.startswith("$") and d not in ("System Volume Information",) and not os.path.isjunction(os.path.join(root, d))]
                     for filename in files:
                         if self._cancelled:
                             break
@@ -719,7 +378,7 @@ class DiskScanner:
                 for root, dirs, files in os.walk(scan_root):
                     if self._cancelled:
                         break
-                    dirs[:] = [d for d in dirs if not d.startswith("$") and d not in ("System Volume Information",)]
+                    dirs[:] = [d for d in dirs if not d.startswith("$") and d not in ("System Volume Information",) and not os.path.isjunction(os.path.join(root, d))]
                     for filename in files:
                         if self._cancelled:
                             break
