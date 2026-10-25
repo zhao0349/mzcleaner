@@ -63,7 +63,7 @@ def main():
             if p.is_file():
                 z.write(p, Path('MzCleanerFree')/p.relative_to(APP))
     source_zip = OUT/f'MzCleanerFree-{VERSION}-source.zip'
-    subprocess.run(['git', '-C', str(ROOT), 'archive', '--format=zip',
+    subprocess.run(['git', '-c', 'core.autocrlf=false', '-C', str(ROOT), 'archive', '--format=zip',
                     '--prefix=MzCleanerFree-source/', '-o', str(source_zip), 'HEAD'], check=True)
     (OUT/'SHA256SUMS.txt').write_text(''.join(f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}\n' for p in [portable, source_zip]), encoding='utf-8')
     print(json.dumps({'source_commit': info['source_commit'], 'packages': [str(portable), str(source_zip)]}, indent=2))
